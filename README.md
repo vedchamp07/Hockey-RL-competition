@@ -1,6 +1,6 @@
-# ERG Hockey RL Competition
+# EnR Guild Hockey RL Competition
 
-Recruitment tournament hosted by the **Electronics and Robotics Guild (ERG)** at IIT Madras. Train an RL agent for 2-player laser hockey. The public leaderboard is the entry ticket — the live viva is the filter.
+Recruitment tournament hosted by the **EnR Guild** at IIT Madras. Train an RL agent for 2-player laser hockey. The public leaderboard is the entry ticket — the live viva is the filter.
 
 **Start here:** [guide/getting-started.pdf](guide/getting-started.pdf)
 
