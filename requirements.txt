@@ -1,8 +1,6 @@
-numpy
-pandas
 gymnasium
+numpy
+torch
 box2d-py
 pygame
-stable-baselines3
-torch
 hockey @ git+https://github.com/martius-lab/hockey-env.git

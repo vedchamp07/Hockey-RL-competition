@@ -1,19 +1,19 @@
 """Environment wrappers for the hockey RL competition."""
 
-from .hockey_wrapper import (
+from .hockey_env import (
     ACTION_DIM,
-    EVAL_SEED,
+    MAX_STEPS,
     OBS_DIM,
-    HockeyGame,
-    HockeySingleAgentEnv,
+    HockeyEnv,
+    SingleAgentHockey,
     clip_action,
 )
 
 __all__ = [
     "ACTION_DIM",
-    "EVAL_SEED",
+    "MAX_STEPS",
     "OBS_DIM",
-    "HockeyGame",
-    "HockeySingleAgentEnv",
+    "HockeyEnv",
+    "SingleAgentHockey",
     "clip_action",
 ]

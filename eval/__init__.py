@@ -1,26 +1,27 @@
-"""Evaluation APIs for matches and round-robin tournaments."""
+"""Evaluation package: matches, ladder, brawl, leaderboard blend."""
 
 from __future__ import annotations
 
 from typing import Any
 
-
-__all__ = ["run_match", "run_tournament", "load_agent_from_dir"]
+__all__ = ["play_match", "ladder_score", "run_brawl", "blend"]
 
 
 def __getattr__(name: str) -> Any:
-    """Load public APIs lazily so ``python -m eval.<module>`` stays warning-free."""
+    if name == "play_match":
+        from eval.match import play_match
 
-    if name in {"run_match", "load_agent_from_dir"}:
-        from eval.match import load_agent_from_dir, run_match
+        return play_match
+    if name == "ladder_score":
+        from eval.ladder import ladder_score
 
-        value = {"run_match": run_match, "load_agent_from_dir": load_agent_from_dir}[name]
-    elif name == "run_tournament":
-        from eval.tournament import run_tournament
+        return ladder_score
+    if name == "run_brawl":
+        from eval.brawl import run_brawl
 
-        value = run_tournament
-    else:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return run_brawl
+    if name == "blend":
+        from eval.leaderboard import blend
 
-    globals()[name] = value
-    return value
+        return blend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

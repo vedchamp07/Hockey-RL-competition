@@ -6,11 +6,9 @@ venv/
 .env
 .env.*
 
-# Organizer-only notes — not for participants
-CONTEXT.md
-
 *.zip
-my_agent.zip
+/submission.zip
+my_agent*.zip
 
 results/*.json
 results/*.csv
@@ -25,14 +23,3 @@ tensorboard/
 
 /submissions/*
 !/submissions/.gitkeep
-
-# LaTeX aux; keep the compiled handbook PDF
-guide/*.aux
-guide/*.log
-guide/*.out
-guide/*.toc
-guide/*.fls
-guide/*.fdb_latexmk
-guide/*.synctex.gz
-guide/preview*.png
-guide/*.xdv

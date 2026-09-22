@@ -1,563 +1,227 @@
-"""Run reproducible, failure-tolerant matches between hockey agents."""
+"""Reproducible head-to-head matches between hockey agents."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
-import importlib
 import importlib.util
 import json
-import os
-from pathlib import Path
-import signal
-import subprocess
 import sys
-import tempfile
-import time
-from typing import Any, Callable, Protocol
 import uuid
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from env.hockey_wrapper import EVAL_SEED, HockeyGame
+from domain_random import PUBLIC_RANGE, sample_physics
+from env.hockey_env import HockeyEnv
+
+ZERO_ACTION = np.zeros(4, dtype=np.float32)
+MAX_STEPS = 250
+FAIL_FORFEIT = 5
 
 
-class Agent(Protocol):
-    """Structural type implemented by every submitted agent."""
-
-    def act(self, observation: np.ndarray) -> np.ndarray:
-        """Return one four-dimensional action."""
-
-
-MatchResult = dict[str, Any]
-ProgressCallback = Callable[[MatchResult], None]
-
-
-def _error_text(error: BaseException) -> str:
-    message = f"{type(error).__name__}: {error}"
-    return message if len(message) <= 500 else f"{message[:497]}..."
-
-
-def _new_result() -> MatchResult:
-    return {
-        "agent1_wins": 0,
-        "agent2_wins": 0,
-        "draws": 0,
-        "total_episodes": 0,
-        "timeout": False,
-        "agent1_forfeits": 0,
-        "agent2_forfeits": 0,
-        "errors": [],
-    }
-
-
-def _safe_action(agent: Agent, observation: np.ndarray) -> tuple[np.ndarray | None, str | None]:
-    try:
-        action = agent.act(np.asarray(observation).copy())
-        if not isinstance(action, np.ndarray):
-            return None, "act() must return a numpy.ndarray"
-        if action.shape != (4,):
-            return None, f"act() returned shape {action.shape}, expected (4,)"
-        if not np.issubdtype(action.dtype, np.number):
-            return None, f"act() returned non-numeric dtype {action.dtype}"
-        action = np.asarray(action, dtype=np.float32)
-        if not np.all(np.isfinite(action)):
-            return None, "act() returned a non-finite action"
-        return np.clip(action, -1.0, 1.0), None
-    except BaseException as error:
-        return None, _error_text(error)
-
-
-def _record_physical_winner(
-    result: MatchResult,
-    winner: int,
-    agent1_is_player1: bool,
-) -> None:
-    if winner == 0:
-        result["draws"] += 1
-    elif (winner == 1) == agent1_is_player1:
-        result["agent1_wins"] += 1
-    else:
-        result["agent2_wins"] += 1
-    result["total_episodes"] += 1
-
-
-def _record_forfeit(
-    result: MatchResult,
-    *,
-    agent1_failed: bool,
-    agent2_failed: bool,
-    episode_index: int,
-    agent1_error: str | None,
-    agent2_error: str | None,
-) -> None:
-    if agent1_failed:
-        result["agent1_forfeits"] += 1
-        result["errors"].append(
-            {"episode": episode_index, "agent": "agent1", "error": agent1_error}
-        )
-    if agent2_failed:
-        result["agent2_forfeits"] += 1
-        result["errors"].append(
-            {"episode": episode_index, "agent": "agent2", "error": agent2_error}
-        )
-
-    if agent1_failed and agent2_failed:
-        result["draws"] += 1
-    elif agent1_failed:
-        result["agent2_wins"] += 1
-    else:
-        result["agent1_wins"] += 1
-    result["total_episodes"] += 1
-
-
-def _fill_remaining_draws(result: MatchResult, n_episodes: int) -> MatchResult:
-    completed = int(result.get("total_episodes", 0))
-    remaining = max(0, n_episodes - completed)
-    result["draws"] = int(result.get("draws", 0)) + remaining
-    result["total_episodes"] = completed + remaining
-    return result
-
-
-def _run_match(
-    agent1: Agent,
-    agent2: Agent,
-    n_episodes: int,
-    timeout_seconds: int,
-    progress_callback: ProgressCallback | None = None,
-) -> MatchResult:
-    if n_episodes < 0:
-        raise ValueError("n_episodes must be non-negative")
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-
-    result = _new_result()
-    deadline = time.monotonic() + timeout_seconds
-    game: HockeyGame | None = None
+def _safe_act(agent: Any, obs: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Return (action, failed). On exception, substitute zeros."""
 
     try:
+        action = agent.act(np.asarray(obs, dtype=np.float32))
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.size < 4 or not np.all(np.isfinite(arr[:4])):
+            return ZERO_ACTION.copy(), True
+        return np.clip(arr[:4], -1.0, 1.0).astype(np.float32), False
+    except BaseException:
+        return ZERO_ACTION.copy(), True
+
+
+def play_match(
+    agent_a_factory: Callable[[], Any],
+    agent_b_factory: Callable[[], Any],
+    n_games: int = 20,
+    seed_base: int = 0,
+    phys_range: tuple[float, float] = PUBLIC_RANGE,
+) -> dict:
+    """Factories are callables returning a fresh agent (side swap needs new instances).
+
+    Same physics seed for both sides: sample_physics(phys_range, seed=seed_base+g)
+    once per game. Alternate sides: game g even, A is left; odd, B is left.
+    Max 250 steps. Stop on terminated or truncated.
+    """
+
+    score = {"A": 0, "B": 0, "draw": 0, "games": int(n_games)}
+    for g in range(n_games):
+        a_is_left = g % 2 == 0
+        left = agent_a_factory() if a_is_left else agent_b_factory()
+        right = agent_b_factory() if a_is_left else agent_a_factory()
+
+        seed = seed_base + g
+        physics = sample_physics(phys_range, seed=seed)
+        # Physics applied once via constructor → reset(); do not re-apply.
+        env = HockeyEnv(mode="normal", physics=physics)
+
         try:
-            game = HockeyGame(seed=EVAL_SEED)
-        except BaseException as error:
-            result["errors"].append({"episode": None, "agent": "environment", "error": _error_text(error)})
-            _fill_remaining_draws(result, n_episodes)
-            if progress_callback:
-                progress_callback(result)
-            return result
+            obs, info = env.reset(seed=seed)
+            obs2 = env.obs_agent_two()
+            fails_left = 0
+            fails_right = 0
+            winner = 0
 
-        for episode_index in range(n_episodes):
-            if time.monotonic() >= deadline:
-                result["timeout"] = True
-                _fill_remaining_draws(result, n_episodes)
-                if progress_callback:
-                    progress_callback(result)
-                break
-
-            agent1_is_player1 = episode_index % 2 == 0
-            player1 = agent1 if agent1_is_player1 else agent2
-            player2 = agent2 if agent1_is_player1 else agent1
-
-            try:
-                observation1, _ = game.reset(seed=EVAL_SEED + episode_index)
-                observation2 = game.obs_agent_two()
-            except BaseException as error:
-                result["errors"].append(
-                    {"episode": episode_index, "agent": "environment", "error": _error_text(error)}
-                )
-                result["draws"] += 1
-                result["total_episodes"] += 1
-                if progress_callback:
-                    progress_callback(result)
-                continue
-
-            episode_finished = False
-            while not episode_finished:
-                if time.monotonic() >= deadline:
-                    result["timeout"] = True
-                    _fill_remaining_draws(result, n_episodes)
-                    if progress_callback:
-                        progress_callback(result)
-                    episode_finished = True
+            for _ in range(MAX_STEPS):
+                a1, fail1 = _safe_act(left, obs)
+                a2, fail2 = _safe_act(right, obs2)
+                if fail1:
+                    fails_left += 1
+                if fail2:
+                    fails_right += 1
+                if fails_left >= FAIL_FORFEIT or fails_right >= FAIL_FORFEIT:
+                    if fails_left >= FAIL_FORFEIT and fails_right >= FAIL_FORFEIT:
+                        winner = 0
+                    elif fails_left >= FAIL_FORFEIT:
+                        winner = -1  # right wins
+                    else:
+                        winner = 1  # left wins
                     break
 
-                action1, player1_error = _safe_action(player1, observation1)
-                action2, player2_error = _safe_action(player2, observation2)
+                obs, _reward, terminated, truncated, info = env.step(np.hstack([a1, a2]))
+                obs2 = env.obs_agent_two()
+                if terminated or truncated:
+                    winner = int(info.get("winner", 0))
+                    break
+            else:
+                winner = int(info.get("winner", 0))
 
-                if player1_error is not None or player2_error is not None:
-                    if agent1_is_player1:
-                        agent1_error, agent2_error = player1_error, player2_error
-                    else:
-                        agent1_error, agent2_error = player2_error, player1_error
-                    _record_forfeit(
-                        result,
-                        agent1_failed=agent1_error is not None,
-                        agent2_failed=agent2_error is not None,
-                        episode_index=episode_index,
-                        agent1_error=agent1_error,
-                        agent2_error=agent2_error,
-                    )
-                    if progress_callback:
-                        progress_callback(result)
-                    episode_finished = True
-                    continue
-
-                try:
-                    observation1, _, terminated, truncated, info = game.step(action1, action2)
-                    if not (terminated or truncated):
-                        observation2 = game.obs_agent_two()
-                        continue
-
-                    raw_winner = info.get("winner", 0)
-                    winner = int(raw_winner)
-                    if winner not in (-1, 0, 1):
-                        raise ValueError(f"invalid winner value {raw_winner!r}")
-                    _record_physical_winner(result, winner, agent1_is_player1)
-                except BaseException as error:
-                    result["errors"].append(
-                        {"episode": episode_index, "agent": "environment", "error": _error_text(error)}
-                    )
-                    result["draws"] += 1
-                    result["total_episodes"] += 1
-
-                if progress_callback:
-                    progress_callback(result)
-                episode_finished = True
-
-            if result["timeout"]:
-                break
-    finally:
-        if game is not None:
+            if winner == 0:
+                score["draw"] += 1
+            elif (winner == 1) == a_is_left:
+                score["A"] += 1
+            else:
+                score["B"] += 1
+        finally:
             try:
-                game.close()
+                env.close()
             except BaseException:
                 pass
 
-    return result
+    return score
 
 
-def run_match(
-    agent1: Agent,
-    agent2: Agent,
-    n_episodes: int = 20,
-    timeout_seconds: int = 30,
-) -> MatchResult:
-    """
-    Run a match in the current process.
-
-    Call :func:`run_match_isolated` for untrusted submissions so a hanging
-    ``act`` call can be terminated by the parent process.
-    """
-
-    return _run_match(agent1, agent2, n_episodes, timeout_seconds)
-
-
-def load_agent_from_file(agent_file: str):
-    """Import a Python file that defines class ``Agent`` and return ``Agent()``."""
-
-    path = Path(agent_file).expanduser().resolve()
+def _import_agent_class(path: Path):
+    path = path.expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"agent file not found: {path}")
-
     path_hash = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
     module_name = f"_hockey_agent_{path_hash}_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"could not create import spec for {path}")
-
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     parent = str(path.parent)
-    inserted_path = parent not in sys.path
-    if inserted_path:
+    inserted = parent not in sys.path
+    if inserted:
         sys.path.insert(0, parent)
     try:
         spec.loader.exec_module(module)
-        agent_class = getattr(module, "Agent")
-        return agent_class()
+        return getattr(module, "Agent")
     except BaseException:
         sys.modules.pop(module_name, None)
         raise
     finally:
-        if inserted_path:
+        if inserted:
             try:
                 sys.path.remove(parent)
             except ValueError:
                 pass
 
 
-def load_agent_from_dir(agent_dir: str):
-    """Import ``agent.py`` from a directory and return ``Agent()``."""
+class _JitAgent:
+    def __init__(self, weights_path: Path):
+        import torch
 
-    directory = Path(agent_dir).expanduser().resolve()
-    if not directory.is_dir():
-        raise NotADirectoryError(f"agent directory not found: {directory}")
-    return load_agent_from_file(str(directory / "agent.py"))
+        self.net = torch.jit.load(str(weights_path), map_location="cpu")
+        self.net.eval()
+
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        import torch
+
+        with torch.no_grad():
+            x = torch.tensor(np.asarray(obs, dtype=np.float32), dtype=torch.float32).unsqueeze(0)
+            a = self.net(x).squeeze(0).numpy()
+        return np.clip(a, -1.0, 1.0).astype(np.float32)
 
 
-def _load_agent_from_spec(agent_spec: str):
-    path = Path(agent_spec).expanduser()
+class _RandomAgent:
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        del obs
+        return np.random.uniform(-1.0, 1.0, size=4).astype(np.float32)
+
+
+REFERENCE_NAMES = frozenset({"bot", "rusher", "wall", "mirror", "apex"})
+BUILTIN_NAMES = frozenset({"weak", "medium", "random"})
+
+
+def load_agent_factory(spec: str) -> Callable[[], Any]:
+    """Return a zero-arg factory.
+
+    ``spec`` is a .py file, a directory containing agent.py, or a reference /
+    builtin name (bot, rusher, wall, mirror, apex, weak, medium, random).
+    """
+
+    key = spec.strip()
+    lower = key.lower()
+
+    if lower in REFERENCE_NAMES:
+        from baselines.reference import load_reference
+
+        return lambda name=lower: load_reference(name)
+
+    if lower == "random":
+        return _RandomAgent
+
+    if lower in {"weak", "medium"}:
+        weights = REPO_ROOT / "baselines" / f"{lower}.pt"
+
+        def factory(path=weights):
+            if not path.is_file():
+                raise FileNotFoundError(f"missing checkpoint: {path}")
+            return _JitAgent(path)
+
+        return factory
+
+    path = Path(key).expanduser()
     if path.is_dir():
-        return load_agent_from_dir(str(path))
-    if path.is_file():
-        return load_agent_from_file(str(path))
+        agent_path = path / "agent.py"
+        cls = _import_agent_class(agent_path)
+        return cls
+    if path.is_file() and path.suffix == ".py":
+        cls = _import_agent_class(path)
+        return cls
+    if path.suffix == ".py" or "/" in key or key.endswith("agent.py"):
+        cls = _import_agent_class(path)
+        return cls
 
-    looks_like_path = (
-        path.suffix == ".py"
-        or os.sep in agent_spec
-        or (os.altsep is not None and os.altsep in agent_spec)
+    raise ValueError(
+        f"unknown agent spec {spec!r}; use a path or one of "
+        f"{sorted(REFERENCE_NAMES | BUILTIN_NAMES)}"
     )
-    if looks_like_path:
-        candidate = path if path.suffix == ".py" else path / "agent.py"
-        return load_agent_from_file(str(candidate))
-
-    module_name, separator, class_name = agent_spec.partition(":")
-    module = importlib.import_module(module_name)
-    agent_class = getattr(module, class_name if separator else "Agent")
-    return agent_class()
-
-
-def _initialization_failure_result(
-    agent1_error: BaseException | None,
-    agent2_error: BaseException | None,
-    n_episodes: int,
-) -> MatchResult:
-    result = _new_result()
-    agent1_failed = agent1_error is not None
-    agent2_failed = agent2_error is not None
-    if agent1_failed:
-        result["agent1_forfeits"] = n_episodes
-        result["errors"].append(
-            {"episode": None, "agent": "agent1", "error": _error_text(agent1_error)}
-        )
-    if agent2_failed:
-        result["agent2_forfeits"] = n_episodes
-        result["errors"].append(
-            {"episode": None, "agent": "agent2", "error": _error_text(agent2_error)}
-        )
-
-    if agent1_failed and agent2_failed:
-        result["draws"] = n_episodes
-    elif agent1_failed:
-        result["agent2_wins"] = n_episodes
-    else:
-        result["agent1_wins"] = n_episodes
-    result["total_episodes"] = n_episodes
-    return result
-
-
-def _write_progress(path: str | None, result: MatchResult) -> None:
-    if not path:
-        return
-    destination = Path(path)
-    temporary = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(result), encoding="utf-8")
-    os.replace(temporary, destination)
-
-
-def _worker_run(
-    agent1_spec: str,
-    agent2_spec: str,
-    n_episodes: int,
-    timeout_seconds: int,
-    progress_file: str | None,
-) -> MatchResult:
-    agent1 = None
-    agent2 = None
-    agent1_error: BaseException | None = None
-    agent2_error: BaseException | None = None
-
-    with open(os.devnull, "w", encoding="utf-8") as devnull:
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            try:
-                agent1 = _load_agent_from_spec(agent1_spec)
-            except BaseException as error:
-                agent1_error = error
-            try:
-                agent2 = _load_agent_from_spec(agent2_spec)
-            except BaseException as error:
-                agent2_error = error
-
-            if agent1_error is not None or agent2_error is not None:
-                result = _initialization_failure_result(agent1_error, agent2_error, n_episodes)
-                _write_progress(progress_file, result)
-                return result
-
-            assert agent1 is not None and agent2 is not None
-            return _run_match(
-                agent1,
-                agent2,
-                n_episodes,
-                timeout_seconds,
-                progress_callback=lambda current: _write_progress(progress_file, current),
-            )
-
-
-def _read_result_text(output: str | bytes | None) -> MatchResult | None:
-    if output is None:
-        return None
-    if isinstance(output, bytes):
-        output = output.decode("utf-8", errors="replace")
-    for line in reversed(output.splitlines()):
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and "total_episodes" in value:
-            return value
-    return None
-
-
-def _read_progress(path: Path) -> MatchResult | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _kill_worker(process: subprocess.Popen[str]) -> None:
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-    except ProcessLookupError:
-        pass
-
-
-def run_match_isolated(
-    agent1_spec: str,
-    agent2_spec: str,
-    n_episodes: int = 20,
-    timeout_seconds: int = 30,
-) -> MatchResult:
-    """Load two agents in a subprocess and enforce a hard wall-clock timeout."""
-
-    if n_episodes < 0:
-        raise ValueError("n_episodes must be non-negative")
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-
-    with tempfile.TemporaryDirectory(prefix="hockey_match_") as temporary_dir:
-        progress_path = Path(temporary_dir) / "progress.json"
-        command = [
-            sys.executable,
-            "-u",
-            str(Path(__file__).resolve()),
-            "--worker",
-            "--agent1",
-            os.fspath(agent1_spec),
-            "--agent2",
-            os.fspath(agent2_spec),
-            "--episodes",
-            str(n_episodes),
-            "--timeout",
-            str(timeout_seconds),
-            "--progress-file",
-            str(progress_path),
-        ]
-        environment = os.environ.copy()
-        existing_pythonpath = environment.get("PYTHONPATH")
-        environment["PYTHONPATH"] = (
-            str(REPO_ROOT)
-            if not existing_pythonpath
-            else os.pathsep.join((str(REPO_ROOT), existing_pythonpath))
-        )
-
-        process = subprocess.Popen(
-            command,
-            cwd=str(REPO_ROOT),
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=(os.name == "posix"),
-        )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            _kill_worker(process)
-            stdout, stderr = process.communicate()
-            partial_stdout = stdout or error.output
-            result = _read_progress(progress_path) or _read_result_text(partial_stdout) or _new_result()
-            _fill_remaining_draws(result, n_episodes)
-            result["timeout"] = True
-            return result
-
-        result = _read_result_text(stdout) or _read_progress(progress_path)
-        if result is None:
-            result = _new_result()
-            stderr = stderr.strip()
-            result["errors"].append(
-                {
-                    "episode": None,
-                    "agent": "worker",
-                    "error": stderr[-500:] if stderr else f"worker exited with code {process.returncode}",
-                }
-            )
-            _fill_remaining_draws(result, n_episodes)
-            result["worker_error"] = True
-        elif process.returncode != 0:
-            _fill_remaining_draws(result, n_episodes)
-            result["worker_error"] = True
-        return result
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run an isolated hockey match")
-    parser.add_argument("agent_specs", nargs="*", help="two agent files, directories, or import specs")
-    parser.add_argument("--agent1")
-    parser.add_argument("--agent2")
-    parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--timeout", type=int, default=30)
-    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--progress-file", help=argparse.SUPPRESS)
-    return parser
 
 
 def _main() -> int:
-    parser = _build_parser()
+    parser = argparse.ArgumentParser(description="Play a hockey match between two agents")
+    parser.add_argument("--a", required=True, help="agent A: path or reference name")
+    parser.add_argument("--b", required=True, help="agent B: path or reference name")
+    parser.add_argument("--games", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    agent1_spec = args.agent1
-    agent2_spec = args.agent2
-    if agent1_spec is None or agent2_spec is None:
-        if len(args.agent_specs) == 2:
-            agent1_spec, agent2_spec = args.agent_specs
-        elif not sys.stdin.isatty():
-            payload = json.load(sys.stdin)
-            agent1_spec = payload.get("agent1") or payload.get("agent1_spec")
-            agent2_spec = payload.get("agent2") or payload.get("agent2_spec")
-            args.episodes = int(payload.get("n_episodes", args.episodes))
-            args.timeout = int(payload.get("timeout_seconds", args.timeout))
-        else:
-            parser.error("provide two agent specs or a JSON object on stdin")
-
-    if not agent1_spec or not agent2_spec:
-        parser.error("both agent specs are required")
-
-    if args.worker:
-        result = _worker_run(
-            agent1_spec,
-            agent2_spec,
-            args.episodes,
-            args.timeout,
-            args.progress_file,
-        )
-    else:
-        result = run_match_isolated(
-            agent1_spec,
-            agent2_spec,
-            args.episodes,
-            args.timeout,
-        )
-    print(json.dumps(result), flush=True)
+    factory_a = load_agent_factory(args.a)
+    factory_b = load_agent_factory(args.b)
+    result = play_match(factory_a, factory_b, n_games=args.games, seed_base=args.seed)
+    print(json.dumps(result))
     return 0
 
 
